@@ -132,6 +132,7 @@
 
 // Dex3 hands
 #include "../include/dex3_hands.hpp"
+#include "../include/dex1_grippers.hpp"
 
 // Error monitor
 #include "../include/error_monitor.hpp"
@@ -280,6 +281,8 @@ class G1Deploy {
     
     // Dex3 hands manager
     Dex3Hands dex3_hands_;
+    Dex1Grippers dex1_grippers_;
+    bool use_dex1_ = false;
 
     // Motor error monitor (tracks fault state transitions)
     ErrorMonitor error_monitor_;
@@ -2159,7 +2162,8 @@ class G1Deploy {
       std::string zmq_out_topic = "g1_debug",
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
-      double initial_max_close_ratio = 1.0)
+      double initial_max_close_ratio = 1.0,
+      const std::string &hand_type = "dex3")
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2177,6 +2181,7 @@ class G1Deploy {
         enable_motion_recording_(enable_motion_recording),
         initial_vr_3point_compliance_(initial_compliance),
         initial_max_close_ratio_(initial_max_close_ratio),
+        use_dex1_(hand_type == "dex1"),
         //env(ORT_LOGGING_LEVEL_WARNING, "G1Deploy"),
         model_path(model_file_path),
         planner_path(planner_file_path) {
@@ -2184,8 +2189,14 @@ class G1Deploy {
       // Initialize ChannelFactory
       ChannelFactory::Instance()->Init(0, networkInterface);
 
-      // Initialize Dex3 hands (ChannelFactory already initialized above)
-      dex3_hands_.initialize("");
+      // Initialize the selected end-effector (ChannelFactory is already initialized).
+      if (use_dex1_) {
+        dex1_grippers_.initialize();
+        std::cout << "[INFO] Using DEX1 grippers" << std::endl;
+      } else {
+        dex3_hands_.initialize("");
+        std::cout << "[INFO] Using DEX3 hands" << std::endl;
+      }
 
       audio_thread_ = std::make_unique<AudioThread>();
 
@@ -2518,7 +2529,8 @@ class G1Deploy {
         input_interface_->SetVR3PointCompliance(initial_vr_3point_compliance_);
         // Set initial max close ratio for hands (keyboard-controlled: X/C keys)
         input_interface_->SetMaxCloseRatio(initial_max_close_ratio_);
-        dex3_hands_.SetMaxCloseRatio(initial_max_close_ratio_);
+        if (use_dex1_) dex1_grippers_.SetMaxCloseRatio(initial_max_close_ratio_);
+        else dex3_hands_.SetMaxCloseRatio(initial_max_close_ratio_);
         std::cout << "[INFO] Initial VR 3-point compliance: ["
                   << initial_vr_3point_compliance_[0] << ", "
                   << initial_vr_3point_compliance_[1] << ", "
@@ -2678,8 +2690,8 @@ class G1Deploy {
         lowcmd_publisher_->Write(dds_low_command);
       }
 
-      // Publish Dex3 hand commands at the same publish cadence
-      dex3_hands_.writeOnce();
+      if (use_dex1_) dex1_grippers_.writeOnce();
+      else dex3_hands_.writeOnce();
     }
 
     /// Gracefully stop all threads and send a damping-only command.
@@ -2748,12 +2760,12 @@ class G1Deploy {
           motor_command_tmp.q_target.at(i) =
               static_cast<float>(current_pos * (1.0 - ratio) + default_angles[i] * ratio);
         }
-        dex3_hands_.close(true);
-        dex3_hands_.close(false);
+        if (use_dex1_) { dex1_grippers_.close(true); dex1_grippers_.close(false); }
+        else { dex3_hands_.close(true); dex3_hands_.close(false); }
       } else {
         program_state_ = ProgramState::WAIT_FOR_CONTROL;
-        dex3_hands_.open(true);
-        dex3_hands_.open(false);
+        if (use_dex1_) { dex1_grippers_.open(true); dex1_grippers_.open(false); }
+        else { dex3_hands_.open(true); dex3_hands_.open(false); }
         std::cout << "Init Done" << std::endl;
       }
       motor_command_buffer_.SetData(motor_command_tmp);
@@ -2907,7 +2919,9 @@ class G1Deploy {
       std::array<double, 7> right_hand_dq = {0.0};
       
       auto left_hand_state_ptr = dex3_hands_.getState(true);
-      if (left_hand_state_ptr) {
+      if (use_dex1_) {
+        dex1_grippers_.getState(true, left_hand_q[0], left_hand_dq[0]);
+      } else if (left_hand_state_ptr) {
         for (int i = 0; i < 7; ++i) {
           left_hand_q[i] = left_hand_state_ptr->motor_state()[i].q();
           left_hand_dq[i] = left_hand_state_ptr->motor_state()[i].dq();
@@ -2915,7 +2929,9 @@ class G1Deploy {
       }
       
       auto right_hand_state_ptr = dex3_hands_.getState(false);
-      if (right_hand_state_ptr) {
+      if (use_dex1_) {
+        dex1_grippers_.getState(false, right_hand_q[0], right_hand_dq[0]);
+      } else if (right_hand_state_ptr) {
         for (int i = 0; i < 7; ++i) {
           right_hand_q[i] = right_hand_state_ptr->motor_state()[i].q();
           right_hand_dq[i] = right_hand_state_ptr->motor_state()[i].dq();
@@ -3951,11 +3967,17 @@ class G1Deploy {
           auto motor_command_end_time = std::chrono::steady_clock::now();
 
           // Update Dex3 hands max close ratio from keyboard-controlled value (X/C keys)
-          dex3_hands_.SetMaxCloseRatio(input_interface_->GetMaxCloseRatio());
+          if (use_dex1_) dex1_grippers_.SetMaxCloseRatio(input_interface_->GetMaxCloseRatio());
+          else dex3_hands_.SetMaxCloseRatio(input_interface_->GetMaxCloseRatio());
           
           // set hand poses (use buffered data for consistency)
-          dex3_hands_.setAllJointsCommand(true, left_hand_joint_buffer_);
-          dex3_hands_.setAllJointsCommand(false, right_hand_joint_buffer_);
+          if (use_dex1_) {
+            dex1_grippers_.setAllJointsCommand(true, left_hand_joint_buffer_);
+            dex1_grippers_.setAllJointsCommand(false, right_hand_joint_buffer_);
+          } else {
+            dex3_hands_.setAllJointsCommand(true, left_hand_joint_buffer_);
+            dex3_hands_.setAllJointsCommand(false, right_hand_joint_buffer_);
+          }
           
           // Update last hand actions for logging (use buffered data)
           for (int i = 0; i < 7; ++i) {
@@ -4072,7 +4094,7 @@ class G1Deploy {
             }
             
             // Print hand max close ratio (keyboard-controlled via X/C keys)
-            std::cout << " | HandCloseRatio: " << dex3_hands_.GetMaxCloseRatio();
+            std::cout << " | HandCloseRatio: " << (use_dex1_ ? dex1_grippers_.GetMaxCloseRatio() : dex3_hands_.GetMaxCloseRatio());
             
             std::cout << std::endl;
           }
@@ -4135,6 +4157,7 @@ int main(int argc, char const* argv[]) {
     std::cout << "                                 Can specify 1 value (both hands) or 3 values (left_wrist,right_wrist,head)" << std::endl;
     std::cout << "                                 Keyboard controls: g/h = left hand +/- 0.1, b/v = right hand +/- 0.1" << std::endl;
     std::cout << "  --max-close-ratio <value>: set initial hand max close ratio (0.2-1.0; default: 1.0 = full closure)" << std::endl;
+    std::cout << "  --hand-type <dex3|dex1>: select hand hardware (default: dex3)" << std::endl;
     std::cout << "                             0.2 = limited (80% open), 1.0 = full closure allowed" << std::endl;
     std::cout << "                             Keyboard controls: x/c = +/- 0.1 (always available)" << std::endl;
     std::cout << "\nExamples:" << std::endl;
@@ -4180,6 +4203,7 @@ int main(int argc, char const* argv[]) {
   std::string zmq_out_topic = "g1_debug";
   std::array<double, 3> initial_compliance = {0.5, 0.5, 0.0}; // initial compliance is 0.5 for both hands (keyboard controllable)
   double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
+  std::string hand_type = "dex3";
   for (int i = 4; i < argc; i++) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
@@ -4389,6 +4413,13 @@ int main(int argc, char const* argv[]) {
         std::cerr << "Error: --set-compliance requires a value argument" << std::endl;
         exit(1);
       }
+    } else if (std::string(argv[i]) == "--hand-type") {
+      if (i + 1 >= argc || (std::string(argv[i + 1]) != "dex1" && std::string(argv[i + 1]) != "dex3")) {
+        std::cerr << "Error: --hand-type must be 'dex1' or 'dex3'" << std::endl;
+        exit(1);
+      }
+      hand_type = argv[++i];
+      std::cout << "[INFO] Hand type: " << hand_type << std::endl;
     } else if (std::string(argv[i]) == "--max-close-ratio") {
       if (i + 1 < argc) {
         try {
@@ -4441,7 +4472,8 @@ int main(int argc, char const* argv[]) {
     zmq_out_topic,
     enableMotionRecording,
     initial_compliance,
-    initial_max_close_ratio
+    initial_max_close_ratio,
+    hand_type
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   
@@ -4468,4 +4500,3 @@ int main(int argc, char const* argv[]) {
   std::cout << "[DEBUG] Program exiting normally..." << std::endl;
   return 0;
 }
-
