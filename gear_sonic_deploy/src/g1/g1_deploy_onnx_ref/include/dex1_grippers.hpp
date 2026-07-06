@@ -74,7 +74,7 @@ class Dex1Grippers {
     unitree_go::msg::dds_::MotorCmds_ cmd;
     cmd.cmds().resize(1);
     cmd.cmds()[0].mode(1);
-    cmd.cmds()[0].q(dex1_max_q_);  // Start open; calibrated fully-closed position is q=0.
+    cmd.cmds()[0].q(5.1);  // Start open; calibrated fully-closed position is q=0.
     cmd.cmds()[0].dq(0.0f);
     cmd.cmds()[0].tau(0.0f);
     cmd.cmds()[0].kp(5.0f);
