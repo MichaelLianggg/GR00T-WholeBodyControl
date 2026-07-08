@@ -77,7 +77,7 @@ class Dex1Grippers {
     cmd.cmds()[0].q(5.1);  // Start open; calibrated fully-closed position is q=0.
     cmd.cmds()[0].dq(0.0f);
     cmd.cmds()[0].tau(0.0f);
-    cmd.cmds()[0].kp(5.0f);
+    cmd.cmds()[0].kp(3.0f);
     cmd.cmds()[0].kd(0.05f);
     return cmd;
   }
