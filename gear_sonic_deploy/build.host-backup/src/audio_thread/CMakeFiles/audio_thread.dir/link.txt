@@ -1,0 +1,2 @@
+/usr/bin/ar qc libaudio_thread.a CMakeFiles/audio_thread.dir/audio_thread.cpp.o
+/usr/bin/ranlib libaudio_thread.a

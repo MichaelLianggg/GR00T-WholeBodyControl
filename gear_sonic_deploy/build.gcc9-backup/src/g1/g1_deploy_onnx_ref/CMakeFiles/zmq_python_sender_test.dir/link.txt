@@ -1,0 +1,1 @@
+/usr/bin/c++  -O3 -ffast-math -O3 -DNDEBUG CMakeFiles/zmq_python_sender_test.dir/tests/zmq_python_sender_test.cpp.o -o ../../../../target/release/zmq_python_sender_test  /usr/lib/x86_64-linux-gnu/libzmq.so 

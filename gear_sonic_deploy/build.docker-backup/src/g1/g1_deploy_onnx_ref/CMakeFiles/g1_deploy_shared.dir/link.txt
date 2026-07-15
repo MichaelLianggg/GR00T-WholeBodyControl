@@ -1,0 +1,2 @@
+/usr/bin/ar qc libg1_deploy_shared.a CMakeFiles/g1_deploy_shared.dir/src/cnpy.cpp.o CMakeFiles/g1_deploy_shared.dir/src/file_sink.cpp.o CMakeFiles/g1_deploy_shared.dir/src/fk.cpp.o CMakeFiles/g1_deploy_shared.dir/src/state_logger.cpp.o
+/usr/bin/ranlib libg1_deploy_shared.a
