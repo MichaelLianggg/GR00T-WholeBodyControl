@@ -209,6 +209,8 @@ show_usage() {
     echo "  --planner PATH          Set the planner model path (default: planner/example.onnx)"
     echo "  --motion-data PATH      Set the motion data path (default: reference/example_motion/)"
     echo "  --input-type TYPE       Set the input type (default: zmq_manager)"
+    echo "  --enable-shared-autonomy  Enable the shared-autonomy layer (default: off, no-op passthrough)"
+    echo "  --shared-autonomy-logfile PATH  CSV log of sonic_action vs final_action"
     echo "  --output-type TYPE      Set the output type (default: ros2)"
     echo "  --zmq-host HOST         Set the ZMQ host (default: localhost)"
     echo "  --motor-kp-scale SPEC   Scale Kp for hardware motor indices/ranges"
@@ -255,6 +257,7 @@ OUTPUT_TYPE="$OUTPUT_TYPE_DEFAULT"
 ZMQ_HOST="$ZMQ_HOST_DEFAULT"
 MOTOR_KP_SCALES=()
 MOTOR_KD_SCALES=()
+SHARED_AUTONOMY_ARGS=()
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -335,6 +338,18 @@ while [[ $# -gt 0 ]]; do
             MOTOR_KD_SCALES+=("$2")
             shift 2
             ;;
+        --enable-shared-autonomy)
+            SHARED_AUTONOMY_ARGS+=("--enable-shared-autonomy")
+            shift
+            ;;
+        --shared-autonomy-logfile)
+            if [[ -z "$2" ]]; then
+                echo -e "${RED}Error: --shared-autonomy-logfile requires a path argument${NC}" >&2
+                exit 1
+            fi
+            SHARED_AUTONOMY_ARGS+=("--shared-autonomy-logfile" "$2")
+            shift 2
+            ;;
         sim|real)
             INTERFACE_MODE="$1"
             shift
@@ -412,6 +427,9 @@ done
 for scale in "${MOTOR_KD_SCALES[@]}"; do
     EXTRA_ARGS+=("--motor-kd-scale" "$scale")
 done
+if (( ${#SHARED_AUTONOMY_ARGS[@]} > 0 )); then
+    EXTRA_ARGS+=("${SHARED_AUTONOMY_ARGS[@]}")
+fi
 
 # ============================================================================
 # Step 1: Check Prerequisites

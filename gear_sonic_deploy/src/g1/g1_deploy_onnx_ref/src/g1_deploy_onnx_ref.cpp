@@ -62,6 +62,7 @@
 #include <cstring>
 #include <functional>
 #include <unordered_map>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <chrono>
@@ -104,6 +105,11 @@
 #include "../include/robot_parameters.hpp"
 #include "../include/policy_parameters.hpp"
 #include "../include/motor_gain_scaling.hpp"
+
+// Shared-autonomy layer (post-policy, pre-MotorCommand)
+#include "../include/shared_autonomy.hpp"
+static_assert(SharedAutonomyWrapper::kNumBodyJoints == static_cast<std::size_t>(G1_NUM_MOTOR),
+              "SharedAutonomyWrapper body action width must match G1_NUM_MOTOR");
 
 // Input interface and input handlers
 #include "../include/input_interface/keyboard_handler.hpp"
@@ -302,6 +308,19 @@ class G1Deploy {
     std::array<double, G1_NUM_MOTOR> last_action;
     std::array<double, 7> last_left_hand_action;
     std::array<double, 7> last_right_hand_action;
+
+    // =========================================================================
+    // Shared autonomy (post-policy modulation seam)
+    //
+    // Disabled unless --enable-shared-autonomy is passed, and a no-op even when
+    // enabled in this revision: final_action == sonic_action.  Buffers are
+    // members (not locals) so the 50 Hz control loop performs no allocation.
+    // =========================================================================
+    SharedAutonomyWrapper shared_autonomy_;
+    SharedAutonomyWrapper::BodyAction sonic_action_{};   ///< Raw policy output, IsaacLab order.
+    SharedAutonomyWrapper::BodyAction final_action_{};   ///< Post-wrapper action, IsaacLab order.
+    SharedAutonomyWrapper::HandAction left_hand_final_{};
+    SharedAutonomyWrapper::HandAction right_hand_final_{};
     
     // =========================================================================
     // Logging / recording streams
@@ -2164,7 +2183,9 @@ class G1Deploy {
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
       double initial_max_close_ratio = 1.0,
-      MotorGainScaleConfig motor_gain_scales = {})
+      MotorGainScaleConfig motor_gain_scales = {},
+      bool enable_shared_autonomy = false,
+      std::string shared_autonomy_logfile = "")
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2464,6 +2485,25 @@ class G1Deploy {
         throw;  // Re-throw to stop program initialization
       }
 
+      // Shared autonomy: off unless explicitly requested, so the default
+      // invocation is byte-for-byte the previous behaviour.
+      if (enable_shared_autonomy) {
+        shared_autonomy_.setEnabled(true);
+        std::string sa_log = shared_autonomy_logfile;
+        if (sa_log.empty()) {
+          sa_log = (logs_dir.empty() ? std::string("logs") : logs_dir) + "/shared_autonomy.csv";
+        }
+        std::error_code ec;
+        const auto parent = std::filesystem::path(sa_log).parent_path();
+        if (!parent.empty()) { std::filesystem::create_directories(parent, ec); }
+        if (!shared_autonomy_.StartLogging(sa_log)) {
+          std::cerr << "[WARNING] Shared-autonomy logging disabled (could not open "
+                    << sa_log << "); control is unaffected." << std::endl;
+        }
+        std::cout << "[INFO] Shared autonomy ENABLED (no-op passthrough in this build)"
+                  << std::endl;
+      }
+
       // Initialize input interface based on type
       if (input_type == "gamepad") {
         input_interface_ = std::make_unique<unitree::common::Gamepad>();
@@ -2717,6 +2757,8 @@ class G1Deploy {
       }
       CreateDampingCommand();
       LowCommandWriter();
+      // Flush and join the shared-autonomy log writer (idempotent).
+      shared_autonomy_.StopLogging();
       std::cout << "Stop" << std::endl;
     }
 
@@ -3133,12 +3175,27 @@ class G1Deploy {
       
       // Access actions from control policy's internal buffer (already populated by Infer)
       auto& action_buffer = policy_engine_->GetActionBuffer();
-      float* floatarr = action_buffer.data();
-      
+      const float* floatarr = action_buffer.data();
+
+      // ---- Shared-autonomy seam -------------------------------------------
+      // Snapshot the raw policy output instead of mutating the TensorRT buffer,
+      // then hand a copy to the wrapper.  With the wrapper disabled (default)
+      // or in its current no-op form, final_action_ == sonic_action_ exactly.
+      for (int i = 0; i < G1_NUM_MOTOR; i++) {
+        sonic_action_[i] = floatarr[i];
+      }
+      final_action_ = sonic_action_;
+      shared_autonomy_.ApplyBodyAction(final_action_);
+      // ---------------------------------------------------------------------
+
       MotorCommand motor_command_tmp;
       for (int i = 0; i < G1_NUM_MOTOR; i++) {
-        const double action_value = static_cast<double>(floatarr[isaaclab_to_mujoco[i]]) * g1_action_scale[i];
-        last_action[i] = static_cast<double>(floatarr[i]);
+        const double action_value = static_cast<double>(final_action_[isaaclab_to_mujoco[i]]) * g1_action_scale[i];
+        // NOTE: the last-action observation deliberately still carries the raw
+        // SONIC action.  Feeding final_action_ back instead is a separate
+        // experiment to run once real assistance exists; while the wrapper is
+        // a no-op the two are identical either way.
+        last_action[i] = static_cast<double>(sonic_action_[i]);
         motor_command_tmp.q_target.at(i) = static_cast<float>(default_angles[i] + action_value);
         motor_command_tmp.tau_ff.at(i) = 0.0;
         motor_command_tmp.kp.at(i) = kps[i];
@@ -3970,17 +4027,35 @@ class G1Deploy {
 
           // Update Dex3 hands max close ratio from keyboard-controlled value (X/C keys)
           dex3_hands_.SetMaxCloseRatio(input_interface_->GetMaxCloseRatio());
-          
+
+          // ---- Shared-autonomy seam (hands) ---------------------------------
+          // Work on copies so the raw operator command stays available for
+          // logging.  Dex3Hands::writeOnce() still applies its max-close-ratio
+          // clipping and per-tick delta rate limit downstream — not bypassed.
+          left_hand_final_ = left_hand_joint_buffer_;
+          right_hand_final_ = right_hand_joint_buffer_;
+          shared_autonomy_.ApplyHandAction(true, left_hand_final_);
+          shared_autonomy_.ApplyHandAction(false, right_hand_final_);
+          // -------------------------------------------------------------------
+
           // set hand poses (use buffered data for consistency)
-          dex3_hands_.setAllJointsCommand(true, left_hand_joint_buffer_);
-          dex3_hands_.setAllJointsCommand(false, right_hand_joint_buffer_);
-          
-          // Update last hand actions for logging (use buffered data)
+          dex3_hands_.setAllJointsCommand(true, left_hand_final_);
+          dex3_hands_.setAllJointsCommand(false, right_hand_final_);
+
+          // Update last hand actions for logging (what was actually commanded)
           for (int i = 0; i < 7; ++i) {
-            last_left_hand_action[i] = left_hand_joint_buffer_[i];
-            last_right_hand_action[i] = right_hand_joint_buffer_[i];
+            last_left_hand_action[i] = left_hand_final_[i];
+            last_right_hand_action[i] = right_hand_final_[i];
           }
-          
+
+          // Record sonic_action / final_action and both hand channels.
+          // Lock-free ring-buffer store; the CSV write happens on the
+          // wrapper's own writer thread.  No-op unless logging was started.
+          shared_autonomy_.LogStep(static_cast<std::uint64_t>(logging_counter_),
+                                   sonic_action_, final_action_,
+                                   left_hand_joint_buffer_, left_hand_final_,
+                                   right_hand_joint_buffer_, right_hand_final_);
+
           auto hand_joint_end_time = std::chrono::steady_clock::now();
 
           // Publish output data (state logger data, robot config, command/motion data) to all output interfaces
@@ -4091,7 +4166,17 @@ class G1Deploy {
             
             // Print hand max close ratio (keyboard-controlled via X/C keys)
             std::cout << " | HandCloseRatio: " << dex3_hands_.GetMaxCloseRatio();
-            
+
+            // Shared-autonomy intervention magnitudes (expected: all 0 while no-op)
+            if (shared_autonomy_.isEnabled()) {
+              const auto& m = shared_autonomy_.metrics();
+              std::cout << " | SA [body,L,R]: [" << m.body << ", " << m.left_hand
+                        << ", " << m.right_hand << "]";
+              if (shared_autonomy_.nonfinite_count() > 0) {
+                std::cout << " ⚠ non-finite=" << shared_autonomy_.nonfinite_count();
+              }
+            }
+
             std::cout << std::endl;
           }
           break;
@@ -4168,6 +4253,8 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --logs-dir <path>: optional logs output base directory (default: logs/<timestamp>/)" << std::endl;
     std::cout << "  --enable-csv-logs: enable writing CSV logs (default: OFF)" << std::endl;
     std::cout << "  --enable-motion-recording: enable motion recording for ZMQ/planner (default: OFF)" << std::endl;
+    std::cout << "  --enable-shared-autonomy: enable the shared-autonomy layer (default: OFF, currently a no-op passthrough)" << std::endl;
+    std::cout << "  --shared-autonomy-logfile <path>: CSV log for sonic_action vs final_action (default: <logs-dir>/shared_autonomy.csv)" << std::endl;
     std::cout << "  --set-compliance <value>: set initial VR 3-point compliance (0.01=rigid, 0.5=compliant; default: [0.5, 0.5, 0.0])" << std::endl;
     std::cout << "                                 Can specify 1 value (both hands) or 3 values (left_wrist,right_wrist,head)" << std::endl;
     std::cout << "                                 Keyboard controls: g/h = left hand +/- 0.1, b/v = right hand +/- 0.1" << std::endl;
@@ -4218,10 +4305,24 @@ int main(int argc, char const* argv[]) {
   std::array<double, 3> initial_compliance = {0.5, 0.5, 0.0}; // initial compliance is 0.5 for both hands (keyboard controllable)
   double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
   MotorGainScaleConfig motor_gain_scales;
+  bool enableSharedAutonomy = false;    // default off; enable with --enable-shared-autonomy
+  std::string sharedAutonomyLogfile = "";
   for (int i = 4; i < argc; i++) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
       std::cout << "[INFO] CRC checking disabled for MuJoCo simulation" << std::endl;
+    } else if (std::string(argv[i]) == "--enable-shared-autonomy") {
+      enableSharedAutonomy = true;
+      std::cout << "[INFO] Shared autonomy enabled (no-op passthrough in this build)" << std::endl;
+    } else if (std::string(argv[i]) == "--shared-autonomy-logfile") {
+      if (i + 1 < argc) {
+        sharedAutonomyLogfile = argv[i + 1];
+        std::cout << "[INFO] Using shared-autonomy logfile: " << sharedAutonomyLogfile << std::endl;
+        i++; // Skip the next argument since it's the logfile path
+      } else {
+        std::cerr << "Error: --shared-autonomy-logfile requires a path argument" << std::endl;
+        exit(1);
+      }
     } else if (std::string(argv[i]) == "--obs-config") {
       if (i + 1 < argc) {
         obsConfigPath = argv[i + 1];
@@ -4488,7 +4589,9 @@ int main(int argc, char const* argv[]) {
     enableMotionRecording,
     initial_compliance,
     initial_max_close_ratio,
-    motor_gain_scales
+    motor_gain_scales,
+    enableSharedAutonomy,
+    sharedAutonomyLogfile
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   
