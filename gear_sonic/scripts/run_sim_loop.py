@@ -37,6 +37,22 @@ def main(config: ArgsConfig):
     wbc_config = config.load_wbc_yaml()
     # NOTE: we will override the interface to local if it is not specified
     wbc_config["ENV_NAME"] = config.env_name
+    # Shared-autonomy viewer overlay (read-only; empty path disables it).
+    wbc_config["SHARED_AUTONOMY_CONFIG"] = config.shared_autonomy_config
+    wbc_config["SHARED_AUTONOMY_REPORT_PERIOD"] = config.shared_autonomy_report_period
+    wbc_config["SHARED_AUTONOMY_ANCHOR_WORLD"] = config.shared_autonomy_anchor_world
+    wbc_config["SHARED_AUTONOMY_PUBLISH_PORT"] = config.shared_autonomy_publish_port
+    wbc_config["SHARED_AUTONOMY_STATUS_PORT"] = config.shared_autonomy_status_port
+    wbc_config["SHARED_AUTONOMY_STATUS_HOST"] = config.shared_autonomy_status_host
+    if config.robot_scene:
+        wbc_config["ROBOT_SCENE"] = config.robot_scene
+        print(f"[SharedAutonomy][sim] scene override: {config.robot_scene}")
+    if config.shared_autonomy_anchor_world and config.shared_autonomy_publish_port <= 0:
+        print(
+            "[SharedAutonomy][sim] WARNING: --shared-autonomy-anchor-world only moves the "
+            "markers. Without --shared-autonomy-publish-port the deploy binary still targets "
+            "the pelvis-frame pose from its config, so the drawing and the assist will disagree."
+        )
 
     if config.enable_image_publish:
         assert (

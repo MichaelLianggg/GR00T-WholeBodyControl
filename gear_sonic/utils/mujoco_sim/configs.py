@@ -344,3 +344,29 @@ class SimLoopConfig(BaseConfig):
 
     verbose: bool = False
     """Verbose output, override the base config verbose"""
+
+    shared_autonomy_config: str = "gear_sonic_deploy/policy/shared_autonomy_example.yaml"
+    """Shared-autonomy config to visualise (object box + grasp targets). Empty string disables."""
+
+    shared_autonomy_report_period: float = 0.0
+    """Seconds between wrist-in-pelvis-frame prints for cross-checking the C++ CSV. 0 disables."""
+
+    shared_autonomy_anchor_world: bool = False
+    """Pin the object in the world frame instead of the pelvis frame. SIMULATION ONLY --
+    it relies on MuJoCo ground truth the real robot does not have. Needs
+    --shared-autonomy-publish-port so the deploy binary tracks the anchored pose."""
+
+    shared_autonomy_publish_port: int = 0
+    """Publish the object pose (pelvis frame) on this ZMQ port for the deploy binary. 0 disables."""
+
+    shared_autonomy_status_port: int = 0
+    """Subscribe to the deploy binary's task status on this port to colour the viewer markers
+    by state (MANUAL/ALIGN/GRASP/LIFT/ABORT). 0 disables."""
+
+    shared_autonomy_status_host: str = "localhost"
+    """Host of the deploy binary's task-status publisher."""
+
+    robot_scene: str = ""
+    """Override ROBOT_SCENE from the WBC YAML. Use
+    gear_sonic/data/robot_model/model_data/g1/scene_43dof_pick.xml for the
+    table + graspable box pick scene. Empty keeps the YAML value."""

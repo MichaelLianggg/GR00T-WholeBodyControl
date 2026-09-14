@@ -25,6 +25,7 @@ from gear_sonic.utils.mujoco_sim.metric_utils import check_contact, check_height
 from gear_sonic.utils.mujoco_sim.sim_utils import get_subtree_body_names
 from gear_sonic.utils.mujoco_sim.unitree_sdk2py_bridge import ElasticBand, UnitreeSdk2Bridge
 from gear_sonic.utils.mujoco_sim.robot import Robot
+from gear_sonic.utils.mujoco_sim.shared_autonomy_markers import SharedAutonomyMarkers
 
 GEAR_SONIC_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 
@@ -213,6 +214,24 @@ class DefaultEnv:
             else:
                 mujoco.mj_forward(self.mj_model, self.mj_data)
                 self.viewer = None
+
+        # Shared-autonomy overlay: object + grasp targets from the deploy config,
+        # transformed from the pelvis frame into world each frame. Read-only.
+        self.shared_autonomy_markers = SharedAutonomyMarkers(
+            self.config.get("SHARED_AUTONOMY_CONFIG", ""),
+            report_period_s=float(self.config.get("SHARED_AUTONOMY_REPORT_PERIOD", 0.0)),
+            anchor_to_world=bool(self.config.get("SHARED_AUTONOMY_ANCHOR_WORLD", False)),
+            publish_port=int(self.config.get("SHARED_AUTONOMY_PUBLISH_PORT", 0)),
+        )
+        self.shared_autonomy_markers.connect_status(
+            str(self.config.get("SHARED_AUTONOMY_STATUS_HOST", "localhost")),
+            int(self.config.get("SHARED_AUTONOMY_STATUS_PORT", 0)),
+        )
+        if self.shared_autonomy_markers.active:
+            print(
+                "[SharedAutonomy][sim] drawing object + grasp targets from "
+                f"{self.config.get('SHARED_AUTONOMY_CONFIG')}"
+            )
 
         if self.viewer:
             self.viewer.cam.azimuth = 120
@@ -454,6 +473,7 @@ class DefaultEnv:
 
     def update_viewer(self):
         if self.viewer is not None:
+            self.shared_autonomy_markers.draw(self.viewer, self.mj_model, self.mj_data)
             self.viewer.sync()
 
     def update_viewer_camera(self):

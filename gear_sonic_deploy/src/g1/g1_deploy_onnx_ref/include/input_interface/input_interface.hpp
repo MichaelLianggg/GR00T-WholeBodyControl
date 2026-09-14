@@ -262,6 +262,25 @@ public:
     // =========================================================================
     
     // Get the current max close ratio (keyboard-controlled)
+    /**
+     * @brief Runtime on/off switch for the shared-autonomy arm assist (U key).
+     *
+     * Defaults to on so that enabling the feature on the command line takes
+     * effect; the operator can drop the assist at any moment without stopping
+     * the policy.  Lives on the base class so every input type inherits it,
+     * mirroring how max_close_ratio_ is shared.
+     */
+    virtual bool SharedAutonomyAssistEnabled() const {
+        return shared_autonomy_assist_.load(std::memory_order_relaxed);
+    }
+
+    /// Flip the assist switch; returns the new state.
+    virtual bool ToggleSharedAutonomyAssist() {
+        const bool next = !shared_autonomy_assist_.load(std::memory_order_relaxed);
+        shared_autonomy_assist_.store(next, std::memory_order_relaxed);
+        return next;
+    }
+
     virtual double GetMaxCloseRatio() const {
         return max_close_ratio_;
     }
@@ -496,6 +515,7 @@ protected:
     /// Adjusted via keyboard (X = +0.1, C = −0.1), clamped to [0.2, 1.0].
     /// 1.0 = fully closed allowed (default); use --max-close-ratio CLI arg to limit.
     std::atomic<double> max_close_ratio_{1.0};
+    std::atomic<bool> shared_autonomy_assist_{true};
 
     /// Shared stdin buffer – the InterfaceManager pushes non-manager keys here
     /// for the currently-active interface to consume via ReadStdinChar().

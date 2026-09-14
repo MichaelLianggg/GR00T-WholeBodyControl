@@ -179,6 +179,15 @@ class ZMQManager : public InputInterface {
             report_temperature_flag_ = true;
             is_manager_key = true;
             break;
+          case 'u':
+          case 'U': {
+            // Global shared-autonomy assist toggle
+            const bool on = ToggleSharedAutonomyAssist();
+            std::cout << "[SharedAutonomy] arm assist " << (on ? "ENABLED" : "DISABLED")
+                      << " (U toggles)" << std::endl;
+            is_manager_key = true;
+            break;
+          }
           // Global compliance controls - work across ALL modes
           case 'g':
           case 'G':

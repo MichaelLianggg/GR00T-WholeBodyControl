@@ -1,0 +1,2 @@
+/usr/bin/ar qc libTRTInference.a CMakeFiles/TRTInference.dir/InferenceEngine.cpp.o
+/usr/bin/ranlib libTRTInference.a

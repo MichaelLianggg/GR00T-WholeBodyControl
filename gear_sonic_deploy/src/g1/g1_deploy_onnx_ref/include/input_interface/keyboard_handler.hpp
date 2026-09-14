@@ -255,6 +255,13 @@ class SimpleKeyboard : public InputInterface {
                 case 'Z': encoder_mode_toggle = true; break; // Toggle encoder mode
                 case 'f':
                 case 'F': report_temperature = true; break; // Report motor temperatures
+                case 'u':
+                case 'U': { // Toggle the shared-autonomy arm assist
+                  const bool on = ToggleSharedAutonomyAssist();
+                  std::cout << "[SharedAutonomy] arm assist " << (on ? "ENABLED" : "DISABLED")
+                            << " (U toggles)" << std::endl;
+                  break;
+                }
             }
 
             // Limit movement speed and height to the range of the movement mode
@@ -317,6 +324,13 @@ class SimpleKeyboard : public InputInterface {
             case 'Z': encoder_mode_toggle = true; break; // Toggle encoder mode
             case 'h':
             case 'H': report_temperature = true; break; // Report motor temperatures
+            case 'u':
+            case 'U': { // Toggle the shared-autonomy arm assist
+              const bool on = ToggleSharedAutonomyAssist();
+              std::cout << "[SharedAutonomy] arm assist " << (on ? "ENABLED" : "DISABLED")
+                        << " (U toggles)" << std::endl;
+              break;
+            }
           }
         }
         

@@ -220,6 +220,13 @@ public:
                 case 'O': stop_control = true; break;
                 case 'f':
                 case 'F': report_temperature = true; break;
+                case 'u':
+                case 'U': { // Toggle the shared-autonomy arm assist
+                  const bool on = ToggleSharedAutonomyAssist();
+                  std::cout << "[SharedAutonomy] arm assist " << (on ? "ENABLED" : "DISABLED")
+                            << " (U toggles)" << std::endl;
+                  break;
+                }
                 case 'q':
                 case 'Q': delta_left = true; break;
                 case 'e':

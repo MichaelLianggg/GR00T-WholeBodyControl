@@ -59,6 +59,47 @@ RobotFK::RobotFK(const std::string &xmlfile)
     AddNode(root_body);
 }
     
+int RobotFK::FindBodyIndex(const std::string &name) const
+{
+    for(size_t i = 0; i < node_names_.size(); ++i)
+    {
+        if(node_names_[i] == name)
+        {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+int RobotFK::Parent(int idx) const
+{
+    if(idx < 0 || static_cast<size_t>(idx) >= node_parents_.size())
+    {
+        return -1;
+    }
+    return node_parents_[idx];
+}
+
+const std::array<double, 3> &RobotFK::JointAxis(int idx) const
+{
+    static const std::array<double, 3> zero = {0.0, 0.0, 0.0};
+    if(idx < 0 || static_cast<size_t>(idx) >= axes_.size())
+    {
+        return zero;
+    }
+    return axes_[idx];
+}
+
+const std::string &RobotFK::BodyName(int idx) const
+{
+    static const std::string empty;
+    if(idx < 0 || static_cast<size_t>(idx) >= node_names_.size())
+    {
+        return empty;
+    }
+    return node_names_[idx];
+}
+
 void RobotFK::AddNode(XMLNode *node)
 {
     auto nodename = xml_node_attr(node, "name");
@@ -67,6 +108,7 @@ void RobotFK::AddNode(XMLNode *node)
 
     size_t node_idx = node_children_.size();
     node_children_.emplace_back();
+    node_parents_.push_back(-1);
 
     XMLNode *joint = xml_node_find_tag(node, "joint", true);
     if(!joint)
@@ -127,6 +169,7 @@ void RobotFK::AddNode(XMLNode *node)
             size_t child_idx = node_children_.size();
             AddNode(child);
             node_children_[node_idx].push_back(child_idx);
+            node_parents_[child_idx] = static_cast<int>(node_idx);
         }
     }
 }

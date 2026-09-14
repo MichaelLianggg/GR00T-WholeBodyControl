@@ -211,6 +211,10 @@ show_usage() {
     echo "  --input-type TYPE       Set the input type (default: zmq_manager)"
     echo "  --enable-shared-autonomy  Enable the shared-autonomy layer (default: off, no-op passthrough)"
     echo "  --shared-autonomy-logfile PATH  CSV log of sonic_action vs final_action"
+    echo "  --shared-autonomy-config PATH   Object pose config (pelvis frame) for shared autonomy"
+    echo "  --shared-autonomy-robot-xml PATH  MJCF for wrist FK (default: g1/g1_29dof.xml)"
+    echo "  --object-pose-port PORT   Subscribe to a streamed object pose (0 = off)"
+    echo "  --task-status-port PORT   Publish task status for the sim viewer (0 = off)"
     echo "  --output-type TYPE      Set the output type (default: ros2)"
     echo "  --zmq-host HOST         Set the ZMQ host (default: localhost)"
     echo "  --motor-kp-scale SPEC   Scale Kp for hardware motor indices/ranges"
@@ -348,6 +352,46 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             SHARED_AUTONOMY_ARGS+=("--shared-autonomy-logfile" "$2")
+            shift 2
+            ;;
+        --shared-autonomy-config)
+            if [[ -z "$2" ]]; then
+                echo -e "${RED}Error: --shared-autonomy-config requires a path argument${NC}" >&2
+                exit 1
+            fi
+            SHARED_AUTONOMY_ARGS+=("--shared-autonomy-config" "$2")
+            shift 2
+            ;;
+        --object-pose-port)
+            if [[ -z "$2" ]]; then
+                echo -e "${RED}Error: --object-pose-port requires a port argument${NC}" >&2
+                exit 1
+            fi
+            SHARED_AUTONOMY_ARGS+=("--object-pose-port" "$2")
+            shift 2
+            ;;
+        --task-status-port)
+            if [[ -z "$2" ]]; then
+                echo -e "${RED}Error: --task-status-port requires a port argument${NC}" >&2
+                exit 1
+            fi
+            SHARED_AUTONOMY_ARGS+=("--task-status-port" "$2")
+            shift 2
+            ;;
+        --object-pose-host)
+            if [[ -z "$2" ]]; then
+                echo -e "${RED}Error: --object-pose-host requires a host argument${NC}" >&2
+                exit 1
+            fi
+            SHARED_AUTONOMY_ARGS+=("--object-pose-host" "$2")
+            shift 2
+            ;;
+        --shared-autonomy-robot-xml)
+            if [[ -z "$2" ]]; then
+                echo -e "${RED}Error: --shared-autonomy-robot-xml requires a path argument${NC}" >&2
+                exit 1
+            fi
+            SHARED_AUTONOMY_ARGS+=("--shared-autonomy-robot-xml" "$2")
             shift 2
             ;;
         sim|real)

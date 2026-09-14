@@ -107,6 +107,10 @@
 #include "../include/motor_gain_scaling.hpp"
 
 // Shared-autonomy layer (post-policy, pre-MotorCommand)
+#include <zmq.hpp>
+#include <msgpack.hpp>
+#include <map>
+#include "../include/fk.hpp"
 #include "../include/shared_autonomy.hpp"
 static_assert(SharedAutonomyWrapper::kNumBodyJoints == static_cast<std::size_t>(G1_NUM_MOTOR),
               "SharedAutonomyWrapper body action width must match G1_NUM_MOTOR");
@@ -321,6 +325,34 @@ class G1Deploy {
     SharedAutonomyWrapper::BodyAction final_action_{};   ///< Post-wrapper action, IsaacLab order.
     SharedAutonomyWrapper::HandAction left_hand_final_{};
     SharedAutonomyWrapper::HandAction right_hand_final_{};
+
+    // Forward kinematics for the shared-autonomy geometric state.  Only built
+    // when shared autonomy is enabled; null otherwise (geometry stays invalid
+    // and nothing in the control path changes).
+    std::unique_ptr<RobotFK> sa_fk_;
+    int sa_left_wrist_body_ = -1;   ///< RobotFK body index of left_wrist_yaw_link.
+    int sa_right_wrist_body_ = -1;  ///< RobotFK body index of right_wrist_yaw_link.
+    std::vector<std::array<double, 3>> sa_fk_positions_;   ///< Scratch, sized once at construction.
+    std::vector<std::array<double, 4>> sa_fk_rotations_;   ///< Scratch, sized once at construction.
+    std::array<double, G1_NUM_MOTOR> sa_fk_joint_angles_{};///< Absolute joint angles, IsaacLab order.
+
+    // Optional external object-pose source (mock perception).  When a publisher
+    // is streaming, it overrides the static pose from the config file; when it
+    // goes quiet the last received pose simply persists.  Off by default.
+    std::unique_ptr<ZMQPackedMessageSubscriber> object_pose_subscriber_;
+    DataBuffer<SharedAutonomyWrapper::Pose> object_pose_buffer_;
+    bool object_pose_stream_seen_ = false;
+    bool object_pose_stale_ = false;
+    /// A pelvis-frame pose older than this cannot be trusted while the base moves.
+    static constexpr std::chrono::milliseconds OBJECT_POSE_STALE_MS{300};
+
+    // Outbound task-status telemetry for the simulator's viewer overlay.
+    // [topic]["sa_status"][msgpack map], matching how ZMQOutputHandler already
+    // publishes.  Purely informational; nothing in the control path reads it.
+    std::unique_ptr<zmq::context_t> task_status_context_;
+    std::unique_ptr<zmq::socket_t> task_status_socket_;
+    msgpack::sbuffer task_status_sbuf_;
+    bool task_status_first_publish_ = false;
     
     // =========================================================================
     // Logging / recording streams
@@ -2185,7 +2217,12 @@ class G1Deploy {
       double initial_max_close_ratio = 1.0,
       MotorGainScaleConfig motor_gain_scales = {},
       bool enable_shared_autonomy = false,
-      std::string shared_autonomy_logfile = "")
+      std::string shared_autonomy_logfile = "",
+      std::string shared_autonomy_config = "",
+      std::string shared_autonomy_robot_xml = "g1/g1_29dof.xml",
+      std::string object_pose_host = "localhost",
+      int object_pose_port = 0,
+      int task_status_port = 0)
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2489,6 +2526,117 @@ class G1Deploy {
       // invocation is byte-for-byte the previous behaviour.
       if (enable_shared_autonomy) {
         shared_autonomy_.setEnabled(true);
+
+        // Forward kinematics for the geometric state.  Failure here degrades to
+        // "no geometry" rather than aborting: control must be unaffected.
+        try {
+          sa_fk_ = std::make_unique<RobotFK>(shared_autonomy_robot_xml);
+          sa_left_wrist_body_ = sa_fk_->FindBodyIndex("left_wrist_yaw_link");
+          sa_right_wrist_body_ = sa_fk_->FindBodyIndex("right_wrist_yaw_link");
+          if (sa_left_wrist_body_ < 0 || sa_right_wrist_body_ < 0) {
+            std::cerr << "[WARNING] Shared autonomy: wrist links not found in "
+                      << shared_autonomy_robot_xml << "; geometry disabled." << std::endl;
+            sa_fk_.reset();
+          } else {
+            sa_fk_positions_.assign(sa_fk_->NumJoints(), {0.0, 0.0, 0.0});
+            sa_fk_rotations_.assign(sa_fk_->NumJoints(), {1.0, 0.0, 0.0, 0.0});
+            std::cout << "[INFO] Shared autonomy FK ready (" << shared_autonomy_robot_xml
+                      << "): left_wrist_yaw_link=body " << sa_left_wrist_body_
+                      << ", right_wrist_yaw_link=body " << sa_right_wrist_body_
+                      << ", poses in pelvis frame" << std::endl;
+          }
+        } catch (const std::exception& e) {
+          std::cerr << "[WARNING] Shared autonomy: could not load " << shared_autonomy_robot_xml
+                    << " (" << e.what() << "); geometry disabled, control unaffected." << std::endl;
+          sa_fk_.reset();
+        }
+
+        // Optional task-status telemetry (viewer overlay in the simulator).
+        if (task_status_port > 0) {
+          try {
+            task_status_context_ = std::make_unique<zmq::context_t>(1);
+            task_status_socket_ =
+                std::make_unique<zmq::socket_t>(*task_status_context_, ZMQ_PUB);
+            task_status_socket_->bind("tcp://*:" + std::to_string(task_status_port));
+            std::cout << "[INFO] Shared autonomy: publishing task status on tcp://*:"
+                      << task_status_port << " topic='sa_status'" << std::endl;
+          } catch (const std::exception& e) {
+            std::cerr << "[WARNING] Shared autonomy: task-status publisher disabled ("
+                      << e.what() << ")" << std::endl;
+            task_status_socket_.reset();
+          }
+        }
+
+        // Optional streamed object pose.  The simulator acts as a stand-in
+        // perception source; a real camera node would publish the same message.
+        if (object_pose_port > 0) {
+          object_pose_subscriber_ = std::make_unique<ZMQPackedMessageSubscriber>(
+              object_pose_host, object_pose_port, "sa_object",
+              /*timeout_ms=*/100, /*verbose=*/false, /*conflate=*/true, /*rcv_hwm=*/1);
+          object_pose_subscriber_->SetOnDecodedMessage(
+              [this](const std::string&, const ZMQPackedMessageSubscriber::DecodedHeader& hdr,
+                     const std::vector<ZMQPackedMessageSubscriber::BufferView>& bufs) {
+                this->OnObjectPoseReceived(hdr, bufs);
+              });
+          object_pose_subscriber_->Start();
+          std::cout << "[INFO] Shared autonomy: listening for streamed object pose on "
+                    << object_pose_host << ":" << object_pose_port
+                    << " topic='sa_object' (overrides the config pose while it streams)"
+                    << std::endl;
+        }
+
+        // Object pose and grasp targets: read from config, no perception in
+        // this revision.
+        if (!shared_autonomy_config.empty()) {
+          SharedAutonomyWrapper::ObjectConfig object_config;
+          std::string config_error;
+          if (SharedAutonomyWrapper::LoadObjectConfig(shared_autonomy_config, object_config,
+                                                      config_error)) {
+            shared_autonomy_.ApplyObjectConfig(object_config);
+            const auto& o = object_config.object;
+            std::cout << "[INFO] Shared autonomy object pose (pelvis frame): pos=["
+                      << o.position[0] << ", " << o.position[1] << ", " << o.position[2]
+                      << "] quat=[" << o.orientation[0] << ", " << o.orientation[1] << ", "
+                      << o.orientation[2] << ", " << o.orientation[3] << "]" << std::endl;
+            if (object_config.has_grasp_targets) {
+              const auto& lr = object_config.left_grasp_relative.position;
+              const auto& rr = object_config.right_grasp_relative.position;
+              std::cout << "[INFO] Shared autonomy grasp targets (object frame): left=["
+                        << lr[0] << ", " << lr[1] << ", " << lr[2] << "] right=[" << rr[0] << ", "
+                        << rr[1] << ", " << rr[2] << "]" << std::endl;
+            } else {
+              std::cout << "[INFO] Shared autonomy: no grasp targets configured "
+                        << "(add object_size or explicit grasp positions)." << std::endl;
+            }
+            const auto& a = shared_autonomy_.assist_config();
+            if (a.enabled) {
+              std::cout << "[INFO] Shared autonomy ARM ASSIST ACTIVE: alpha=" << a.alpha
+                        << ", engage<" << a.engage_radius << "m, full<" << a.full_radius
+                        << "m, max " << a.max_joint_correction << " rad/joint/tick"
+                        << ", arms only (legs/waist/torso excluded). Press U to toggle."
+                        << std::endl;
+            } else {
+              std::cout << "[INFO] Shared autonomy arm assist DISABLED "
+                        << "(observation only; set assist_enabled: true to engage)." << std::endl;
+            }
+            const auto& t = shared_autonomy_.task_config();
+            if (t.enabled) {
+              std::cout << "[INFO] Shared autonomy PICK SEQUENCE ACTIVE: "
+                        << "ALIGN<" << t.align_enter_radius << "m, GRASP<" << t.grasp_radius
+                        << "m, lift " << t.lift_height << "m over " << t.lift_duration_s << "s"
+                        << ", timeouts align/grasp=" << t.align_timeout_s << "/"
+                        << t.grasp_timeout_s << "s. U disables (and re-arms after an abort)."
+                        << std::endl;
+            }
+          } else {
+            std::cerr << "[WARNING] Shared autonomy: " << config_error
+                      << "; running without an object pose." << std::endl;
+          }
+        } else {
+          std::cout << "[INFO] Shared autonomy: no --shared-autonomy-config given, "
+                    << "wrist poses will be logged without an object." << std::endl;
+        }
+
         std::string sa_log = shared_autonomy_logfile;
         if (sa_log.empty()) {
           sa_log = (logs_dir.empty() ? std::string("logs") : logs_dir) + "/shared_autonomy.csv";
@@ -2758,6 +2906,7 @@ class G1Deploy {
       CreateDampingCommand();
       LowCommandWriter();
       // Flush and join the shared-autonomy log writer (idempotent).
+      if (object_pose_subscriber_) { object_pose_subscriber_->Stop(); }
       shared_autonomy_.StopLogging();
       std::cout << "Stop" << std::endl;
     }
@@ -3150,6 +3299,246 @@ class G1Deploy {
         }
       }
       return true;
+    }
+
+    /**
+     * @brief Publish the shared-autonomy task status for external viewers.
+     *
+     * Non-blocking and best-effort: a missing or slow subscriber must never
+     * affect control, so the send uses ZMQ_DONTWAIT and failures are ignored.
+     */
+    void PublishTaskStatus() {
+      if (!task_status_socket_) { return; }
+
+      // One-shot heartbeat so "the overlay shows nothing" can be diagnosed from
+      // the deploy console instead of guessing which end is at fault.
+      if (!task_status_first_publish_) {
+        task_status_first_publish_ = true;
+        std::cout << "[SharedAutonomy] publishing task status (first frame): state="
+                  << SharedAutonomyWrapper::TaskStateName(shared_autonomy_.task_status().state)
+                  << ", geometry=" << (shared_autonomy_.geometry().valid ? "valid" : "INVALID")
+                  << ", grasp targets="
+                  << (shared_autonomy_.geometry().grasp_targets_valid ? "set" : "NOT SET")
+                  << std::endl;
+      }
+      const auto& ts = shared_autonomy_.task_status();
+      const auto& g = shared_autonomy_.geometry();
+      const auto& la = shared_autonomy_.left_assist();
+      const auto& ra = shared_autonomy_.right_assist();
+
+      // Packed key-by-key rather than through msgpack::type::variant, which is
+      // Boost-backed and is not available in every msgpack build (the repo's
+      // other publisher sidesteps it with a homogeneous map for the same reason).
+      task_status_sbuf_.clear();
+      msgpack::packer<msgpack::sbuffer> pk(&task_status_sbuf_);
+      pk.pack_map(19);
+      pk.pack("state");                pk.pack(static_cast<int32_t>(ts.state));
+      pk.pack("state_name");           pk.pack(std::string(SharedAutonomyWrapper::TaskStateName(ts.state)));
+      pk.pack("time_in_state_s");      pk.pack(ts.time_in_state_s);
+      pk.pack("grasp_trigger");        pk.pack(static_cast<int32_t>(ts.grasp_trigger));
+      pk.pack("lift_trigger");         pk.pack(static_cast<int32_t>(ts.lift_trigger));
+      pk.pack("grasp_success");        pk.pack(static_cast<int32_t>(ts.grasp_success));
+      pk.pack("task_success");         pk.pack(static_cast<int32_t>(ts.task_success));
+      pk.pack("retry_blocked");        pk.pack(static_cast<int32_t>(ts.retry_blocked));
+      pk.pack("completed_picks");      pk.pack(static_cast<uint32_t>(ts.completed_picks));
+      pk.pack("lift_offset_m");        pk.pack(ts.lift_offset_m);
+      pk.pack("left_grasp_residual");  pk.pack(ts.left_grasp_residual);
+      pk.pack("right_grasp_residual"); pk.pack(ts.right_grasp_residual);
+      pk.pack("left_alpha");           pk.pack(la.alpha);
+      pk.pack("right_alpha");          pk.pack(ra.alpha);
+      pk.pack("left_pos_err");         pk.pack(g.left_grasp.position_error_norm);
+      pk.pack("right_pos_err");        pk.pack(g.right_grasp.position_error_norm);
+      pk.pack("assist_enabled");       pk.pack(static_cast<int32_t>(shared_autonomy_.assist_config().enabled));
+      pk.pack("assist_runtime");       pk.pack(static_cast<int32_t>(shared_autonomy_.assist_runtime_enabled()));
+      pk.pack("task_enabled");         pk.pack(static_cast<int32_t>(shared_autonomy_.task_config().enabled));
+      static const std::string topic = "sa_status";
+      zmq::message_t msg(topic.size() + task_status_sbuf_.size());
+      std::memcpy(msg.data(), topic.data(), topic.size());
+      std::memcpy(static_cast<char*>(msg.data()) + topic.size(), task_status_sbuf_.data(),
+                  task_status_sbuf_.size());
+      try {
+        (void)task_status_socket_->send(msg, zmq::send_flags::dontwait);
+      } catch (const std::exception&) {
+        // A dead subscriber must not disturb the control loop.
+      }
+    }
+
+    /**
+     * @brief Decode a streamed object pose (background ZMQ thread).
+     *
+     * Expected fields, both in the **pelvis frame** so the receiver needs no
+     * odometry of its own:
+     *   object_position   f64[3]  (x, y, z)
+     *   object_quaternion f64[4]  (w, x, y, z)
+     *
+     * Runs off the control thread, so the result is handed over through a
+     * DataBuffer and picked up by UpdateSharedAutonomyGeometry().
+     */
+    void OnObjectPoseReceived(const ZMQPackedMessageSubscriber::DecodedHeader& hdr,
+                              const std::vector<ZMQPackedMessageSubscriber::BufferView>& bufs) {
+      SharedAutonomyWrapper::Pose pose;
+      bool have_position = false;
+      bool have_quaternion = false;
+
+      for (size_t i = 0; i < hdr.fields.size() && i < bufs.size(); ++i) {
+        const auto& f = hdr.fields[i];
+        const auto& b = bufs[i];
+        if (f.dtype != "f64" || b.data == nullptr) { continue; }
+        const double* v = static_cast<const double*>(b.data);
+        if (f.name == "object_position" && b.size >= 3 * sizeof(double)) {
+          pose.position = {v[0], v[1], v[2]};
+          have_position = true;
+        } else if (f.name == "object_quaternion" && b.size >= 4 * sizeof(double)) {
+          pose.orientation = {v[0], v[1], v[2], v[3]};
+          have_quaternion = true;
+        }
+      }
+
+      if (!have_position || !have_quaternion) { return; }
+      const double n = std::sqrt(pose.orientation[0] * pose.orientation[0] +
+                                 pose.orientation[1] * pose.orientation[1] +
+                                 pose.orientation[2] * pose.orientation[2] +
+                                 pose.orientation[3] * pose.orientation[3]);
+      if (!(n > 1e-6)) { return; }
+      for (double& c : pose.orientation) { c /= n; }
+      object_pose_buffer_.SetData(pose);
+    }
+
+    /**
+     * @brief Refresh the shared-autonomy geometric state from measured joints.
+     *
+     * Runs forward kinematics on the **measured** joint positions and publishes
+     * the two wrist poses to the wrapper, which pairs them with the configured
+     * object pose and computes wrist-to-object distances.
+     *
+     * Frame: the root pose handed to DoFK() is the identity, so every pose is
+     * expressed in the **pelvis frame** (see SharedAutonomyWrapper::GeometryState).
+     * The deploy stack has no odometry, so no world-frame pose is available.
+     *
+     * Read-only with respect to control: nothing here touches any action or
+     * command.  No-op (and no cost) when shared autonomy is disabled.
+     */
+    void UpdateSharedAutonomyGeometry() {
+      if (!sa_fk_ || sa_left_wrist_body_ < 0 || sa_right_wrist_body_ < 0) { return; }
+      const std::shared_ptr<const LowState_> ls = used_low_state_data_.data;
+      if (!ls) { return; }
+
+      // A streamed object pose (if any) supersedes the static config value.
+      //
+      // Staleness matters here in a way it would not for a world-frame pose:
+      // what arrives is expressed in the PELVIS frame, so a pose that stopped
+      // updating keeps drifting away from the truth as the robot walks, and the
+      // assist would pull toward somewhere the object never was.  Past the
+      // timeout the object is dropped entirely, which closes the gate and sends
+      // the sequence back to MANUAL.
+      if (object_pose_subscriber_) {
+        const auto streamed = object_pose_buffer_.GetDataWithTime();
+        const bool fresh =
+            streamed.data && streamed.GetAgeMs() <= OBJECT_POSE_STALE_MS.count();
+        if (fresh) {
+          shared_autonomy_.SetObjectPose(*streamed.data);
+          if (object_pose_stale_) {
+            object_pose_stale_ = false;
+            std::cout << "[SharedAutonomy] object pose stream recovered" << std::endl;
+          }
+          if (!object_pose_stream_seen_) {
+            object_pose_stream_seen_ = true;
+            std::cout << "[SharedAutonomy] streamed object pose received; "
+                      << "the config pose is now superseded." << std::endl;
+          }
+        } else if (object_pose_stream_seen_ && !object_pose_stale_) {
+          object_pose_stale_ = true;
+          shared_autonomy_.InvalidateObjectPose();
+          std::cerr << "[SharedAutonomy] WARNING: object pose stream stale (> "
+                    << OBJECT_POSE_STALE_MS.count()
+                    << " ms); assist disengaged until it resumes." << std::endl;
+        } else if (object_pose_stale_) {
+          shared_autonomy_.InvalidateObjectPose();
+        }
+      }
+
+      // DoFK() indexes joint_angles in IsaacLab order; motor_state() is in
+      // hardware order, and FK needs absolute angles (no default_angles offset).
+      const auto& motor_state = ls->motor_state();
+      for (int hw = 0; hw < G1_NUM_MOTOR; ++hw) {
+        sa_fk_joint_angles_[isaaclab_to_mujoco[hw]] = motor_state[hw].q();
+      }
+
+      sa_fk_->DoFK(sa_fk_positions_.data(), sa_fk_rotations_.data(),
+                   {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0, 0.0}, sa_fk_joint_angles_.data());
+
+      SharedAutonomyWrapper::Pose left_wrist;
+      left_wrist.position = sa_fk_positions_[sa_left_wrist_body_];
+      left_wrist.orientation = sa_fk_rotations_[sa_left_wrist_body_];
+
+      SharedAutonomyWrapper::Pose right_wrist;
+      right_wrist.position = sa_fk_positions_[sa_right_wrist_body_];
+      right_wrist.orientation = sa_fk_rotations_[sa_right_wrist_body_];
+
+      shared_autonomy_.UpdateGeometry(left_wrist, right_wrist,
+                                      BuildArmJacobian(sa_left_wrist_body_, true),
+                                      BuildArmJacobian(sa_right_wrist_body_, false));
+
+      // Measured Dex3 joints: the only grasp evidence available here, used to
+      // tell a hand closed on an object from a hand closed on air.
+      SharedAutonomyWrapper::HandAction left_hand_q{};
+      SharedAutonomyWrapper::HandAction right_hand_q{};
+      const auto left_hand_state = dex3_hands_.getState(true);
+      const auto right_hand_state = dex3_hands_.getState(false);
+      if (left_hand_state && right_hand_state) {
+        for (int i = 0; i < 7; ++i) {
+          left_hand_q[i] = left_hand_state->motor_state()[i].q();
+          right_hand_q[i] = right_hand_state->motor_state()[i].q();
+        }
+        shared_autonomy_.UpdateHandState(left_hand_q, right_hand_q);
+      }
+
+    }
+
+    /**
+     * @brief Translational Jacobian of one wrist w.r.t. that arm's joints.
+     *
+     * Walks the kinematic chain from the wrist body up to the root and keeps
+     * only bodies whose joint is an **arm** joint (hardware 15-21 left,
+     * 22-28 right).  Legs, waist and torso are dropped here, which is what makes
+     * it structurally impossible for the assist to move them.
+     *
+     * For revolute joint `j` the translational column is the textbook
+     *   `J_j = axis_world_j x (p_wrist - p_j)`
+     * and the angular column is `axis_world_j` itself.
+     * with `axis_world_j = R(rotations_world[j]) * JointAxis(j)`.  Verified
+     * against central finite differences of DoFK() to 6e-7 m/rad.
+     *
+     * Must be called after DoFK() has filled sa_fk_positions_ / sa_fk_rotations_.
+     */
+    SharedAutonomyWrapper::ArmJacobian BuildArmJacobian(int wrist_body, bool is_left) const {
+      SharedAutonomyWrapper::ArmJacobian jac;
+      const int hw_lo = is_left ? LeftShoulderPitch : RightShoulderPitch;  // 15 / 22
+      const int hw_hi = is_left ? LeftWristYaw : RightWristYaw;            // 21 / 28
+      const auto& wrist_pos = sa_fk_positions_[wrist_body];
+
+      for (int body = wrist_body; body > 0; body = sa_fk_->Parent(body)) {
+        const int hw = body - 1;  // body k >= 1 carries hardware joint k - 1
+        if (hw < hw_lo || hw > hw_hi) { continue; }
+        if (jac.count >= static_cast<int>(SharedAutonomyWrapper::kMaxArmJoints)) { break; }
+
+        const auto axis_w = quat_rotate_d(sa_fk_rotations_[body], sa_fk_->JointAxis(body));
+        const auto& joint_pos = sa_fk_positions_[body];
+        const std::array<double, 3> lever = {wrist_pos[0] - joint_pos[0],
+                                             wrist_pos[1] - joint_pos[1],
+                                             wrist_pos[2] - joint_pos[2]};
+        const std::size_t slot = static_cast<std::size_t>(jac.count);
+        jac.joint_hw_index[slot] = hw;
+        jac.column[slot] = {axis_w[1] * lever[2] - axis_w[2] * lever[1],
+                            axis_w[2] * lever[0] - axis_w[0] * lever[2],
+                            axis_w[0] * lever[1] - axis_w[1] * lever[0]};
+        // Angular part: for a revolute joint the wrist's angular velocity per
+        // unit joint rate is just the joint axis, no lever arm involved.
+        jac.angular[slot] = axis_w;
+        ++jac.count;
+      }
+      jac.valid = jac.count > 0;
+      return jac;
     }
 
     /**
@@ -4017,6 +4406,19 @@ class G1Deploy {
 
           auto obs_end_time = std::chrono::steady_clock::now();
 
+          // Shared autonomy needs fresh geometry and the operator's runtime
+          // switch (U key) before the policy action is modulated.
+          shared_autonomy_.SetAssistRuntimeEnabled(
+              input_interface_->SharedAutonomyAssistEnabled());
+          UpdateSharedAutonomyGeometry();
+
+          // Deliberately outside UpdateSharedAutonomyGeometry(): that helper
+          // bails out when FK or LowState is unavailable, and the sequence must
+          // still advance (it falls back to MANUAL) and still report. Coupling
+          // telemetry to FK success meant a silent overlay with no diagnosis.
+          shared_autonomy_.StepTask(control_dt_);
+          PublishTaskStatus();
+
           if (!CreatePolicyCommand()) {
             std::cout << "✗ Error: Failed to create policy command in the middle of the control loop!" << std::endl;
             std::cout << "Stopping control system." << std::endl;
@@ -4172,6 +4574,34 @@ class G1Deploy {
               const auto& m = shared_autonomy_.metrics();
               std::cout << " | SA [body,L,R]: [" << m.body << ", " << m.left_hand
                         << ", " << m.right_hand << "]";
+              const auto& g = shared_autonomy_.geometry();
+              if (g.valid && g.object_valid) {
+                std::cout << " | WristToObj [L,R]: [" << g.left_wrist_to_object << ", "
+                          << g.right_wrist_to_object << "] m";
+              }
+              if (g.valid && g.grasp_targets_valid) {
+                std::cout << " | GraspErr L[" << g.left_grasp.position_error_norm << "m, "
+                          << g.left_grasp.orientation_error_rad << "rad]"
+                          << " R[" << g.right_grasp.position_error_norm << "m, "
+                          << g.right_grasp.orientation_error_rad << "rad]";
+              }
+              if (shared_autonomy_.assist_config().enabled) {
+                const auto& la = shared_autonomy_.left_assist();
+                const auto& ra = shared_autonomy_.right_assist();
+                std::cout << " | Assist" << (shared_autonomy_.assist_runtime_enabled() ? "" : "(OFF,U)")
+                          << " alpha[L,R]=[" << la.alpha << ", " << ra.alpha << "]"
+                          << " maxCorr[L,R]=[" << la.max_abs_correction_rad << ", "
+                          << ra.max_abs_correction_rad << "]rad";
+              }
+              if (shared_autonomy_.task_config().enabled) {
+                const auto& ts = shared_autonomy_.task_status();
+                std::cout << " | Task=" << SharedAutonomyWrapper::TaskStateName(ts.state)
+                          << "(" << ts.time_in_state_s << "s)"
+                          << " grasp[L,R]=[" << ts.left_grasp_residual << ", "
+                          << ts.right_grasp_residual << "]rad"
+                          << " lift=" << ts.lift_offset_m << "m"
+                          << " picks=" << ts.completed_picks;
+              }
               if (shared_autonomy_.nonfinite_count() > 0) {
                 std::cout << " ⚠ non-finite=" << shared_autonomy_.nonfinite_count();
               }
@@ -4255,6 +4685,11 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --enable-motion-recording: enable motion recording for ZMQ/planner (default: OFF)" << std::endl;
     std::cout << "  --enable-shared-autonomy: enable the shared-autonomy layer (default: OFF, currently a no-op passthrough)" << std::endl;
     std::cout << "  --shared-autonomy-logfile <path>: CSV log for sonic_action vs final_action (default: <logs-dir>/shared_autonomy.csv)" << std::endl;
+    std::cout << "  --shared-autonomy-config <path>: object pose config for the shared-autonomy layer (pelvis frame)" << std::endl;
+    std::cout << "  --shared-autonomy-robot-xml <path>: MJCF used for wrist forward kinematics (default: g1/g1_29dof.xml)" << std::endl;
+    std::cout << "  --object-pose-port <port>: subscribe to a streamed object pose (pelvis frame); 0 = off (default)" << std::endl;
+    std::cout << "  --object-pose-host <host>: host of the object-pose publisher (default: localhost)" << std::endl;
+    std::cout << "  --task-status-port <port>: publish shared-autonomy task status for viewers; 0 = off (default)" << std::endl;
     std::cout << "  --set-compliance <value>: set initial VR 3-point compliance (0.01=rigid, 0.5=compliant; default: [0.5, 0.5, 0.0])" << std::endl;
     std::cout << "                                 Can specify 1 value (both hands) or 3 values (left_wrist,right_wrist,head)" << std::endl;
     std::cout << "                                 Keyboard controls: g/h = left hand +/- 0.1, b/v = right hand +/- 0.1" << std::endl;
@@ -4307,6 +4742,11 @@ int main(int argc, char const* argv[]) {
   MotorGainScaleConfig motor_gain_scales;
   bool enableSharedAutonomy = false;    // default off; enable with --enable-shared-autonomy
   std::string sharedAutonomyLogfile = "";
+  std::string sharedAutonomyConfig = "";
+  std::string sharedAutonomyRobotXml = "g1/g1_29dof.xml";
+  std::string objectPoseHost = "localhost";
+  int objectPosePort = 0;   // 0 = no streamed object pose
+  int taskStatusPort = 0;   // 0 = no task-status telemetry
   for (int i = 4; i < argc; i++) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
@@ -4321,6 +4761,52 @@ int main(int argc, char const* argv[]) {
         i++; // Skip the next argument since it's the logfile path
       } else {
         std::cerr << "Error: --shared-autonomy-logfile requires a path argument" << std::endl;
+        exit(1);
+      }
+    
+    } else if (std::string(argv[i]) == "--shared-autonomy-config") {
+      if (i + 1 < argc) {
+        sharedAutonomyConfig = argv[i + 1];
+        std::cout << "[INFO] Using shared-autonomy config: " << sharedAutonomyConfig << std::endl;
+        i++; // Skip the next argument since it's the config path
+      } else {
+        std::cerr << "Error: --shared-autonomy-config requires a path argument" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--object-pose-port") {
+      if (i + 1 < argc) {
+        objectPosePort = std::atoi(argv[i + 1]);
+        std::cout << "[INFO] Streamed object pose port: " << objectPosePort << std::endl;
+        i++;
+      } else {
+        std::cerr << "Error: --object-pose-port requires a port argument" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--task-status-port") {
+      if (i + 1 < argc) {
+        taskStatusPort = std::atoi(argv[i + 1]);
+        std::cout << "[INFO] Task status telemetry port: " << taskStatusPort << std::endl;
+        i++;
+      } else {
+        std::cerr << "Error: --task-status-port requires a port argument" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--object-pose-host") {
+      if (i + 1 < argc) {
+        objectPoseHost = argv[i + 1];
+        std::cout << "[INFO] Streamed object pose host: " << objectPoseHost << std::endl;
+        i++;
+      } else {
+        std::cerr << "Error: --object-pose-host requires a host argument" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--shared-autonomy-robot-xml") {
+      if (i + 1 < argc) {
+        sharedAutonomyRobotXml = argv[i + 1];
+        std::cout << "[INFO] Using shared-autonomy robot XML: " << sharedAutonomyRobotXml << std::endl;
+        i++; // Skip the next argument since it's the XML path
+      } else {
+        std::cerr << "Error: --shared-autonomy-robot-xml requires a path argument" << std::endl;
         exit(1);
       }
     } else if (std::string(argv[i]) == "--obs-config") {
@@ -4559,6 +5045,11 @@ int main(int argc, char const* argv[]) {
     }
   }
 
+  if (!enableSharedAutonomy && (taskStatusPort > 0 || objectPosePort > 0)) {
+    std::cerr << "[WARNING] --task-status-port / --object-pose-port have no effect without "
+              << "--enable-shared-autonomy; no sockets will be opened." << std::endl;
+  }
+
   std::cout << "[DEBUG] Creating G1Deploy object..." << std::endl;
   G1Deploy custom(
     networkInterface,
@@ -4591,7 +5082,12 @@ int main(int argc, char const* argv[]) {
     initial_max_close_ratio,
     motor_gain_scales,
     enableSharedAutonomy,
-    sharedAutonomyLogfile
+    sharedAutonomyLogfile,
+    sharedAutonomyConfig,
+    sharedAutonomyRobotXml,
+    objectPoseHost,
+    objectPosePort,
+    taskStatusPort
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   

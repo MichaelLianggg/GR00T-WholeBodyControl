@@ -1,0 +1,168 @@
+# Shared-autonomy object + bimanual grasp targets.
+#
+# Used with:  --enable-shared-autonomy --shared-autonomy-config <this file>
+#
+# FRAME -- read this before changing the numbers
+# ---------------------------------------------
+# Object pose is in the PELVIS frame: origin at the `pelvis` body origin, axes
+# aligned with the pelvis link (+X forward, +Y left, +Z up when standing).
+#
+# The deploy binary has no odometry, so it cannot know where the pelvis is in
+# the world.  A pose that is constant in this file is therefore fixed *relative
+# to the robot's pelvis* -- it tracks the robot as it walks.  That is fine while
+# the base stays put (stationary bimanual manipulation, the intended first use
+# case); it is not a world-anchored object.  Replacing this file with a real
+# perception input is what removes that limitation.
+#
+# For calibration reference, at the default standing pose (pelvis frame):
+#   left_wrist_yaw_link  = ( 0.097,  0.215, -0.024)
+#   right_wrist_yaw_link = ( 0.097, -0.215, -0.024)
+#   torso_link           = (-0.004,  0.000,  0.054)
+#   ankles               = (-0.001, +-0.119, -0.722)
+
+# Must be "pelvis".  Present so a future world/camera frame cannot be
+# mistaken for this one -- any other value is rejected at startup.
+object_frame: pelvis
+
+# --- Object pose, PELVIS frame ---
+# x y z, metres.
+#
+# MEASURED, not guessed: solving IK over the arm joint limits in MuJoCo, the
+# left wrist cannot reach further than x = 0.383 m from the pelvis, and much
+# less at wrist height.  The 0.45 this file used to ship with was OUT OF REACH,
+# so the assist could never engage.  0.32 is reachable by both arms with zero
+# residual.  z = +0.123 puts the box at 0.88 m world, matching the table in
+# scene_43dof_pick.xml (standing pelvis height is 0.757 m).
+#
+# These values are only a fallback: when the scene contains a physical
+# `sa_object` body, the simulator streams its real pose instead.
+object_position: 0.52 0.0 0.1566
+
+# w x y z, scalar-first (SONIC convention).  Normalised on load.
+object_quaternion: 1.0 0.0 0.0 0.0
+
+# --- Box extents, OBJECT frame (x y z, metres) ---
+# FULL extents in the OBJECT (mesh) frame, where X is the long axis.  MJCF uses
+# HALF extents, so scene_43dof_pick.xml carries size="0.2248 0.0850 0.1172".
+# Measured from orange_box.STL; keep the two in step.
+# With no explicit grasp positions below, the two grasp targets default to the
+# centres of the box's +Y (left) and -Y (right) faces:
+#     left  = (0, +size_y/2, 0)
+#     right = (0, -size_y/2, 0)
+# i.e. a 0.30 m wide box gives targets 0.15 m either side of the object origin.
+object_size: 0.4496 0.1700 0.2344
+
+# --- Grasp targets, OBJECT frame ---
+#
+# IMPORTANT: these are WRIST targets, not contact points.  The assist drives
+# `*_wrist_yaw_link`, and the Dex3 palm sits about 0.12 m further along the
+# wrist's +X axis (measured: thumb tip 0.067 m, fingertips 0.167 m from the
+# wrist origin).  So a target must be the handle position PLUS that palm
+# offset, or the hand overshoots the handle by 12 cm.
+#
+# scene_43dof_pick.xml carries orange_box.STL with two handles on its top face.
+# The object frame is the MESH frame (long axis along X), and the body is yawed
+# 90 deg in the scene so that long axis runs left-right in the world:
+# The crate's OWN handles, measured from orange_box.STL (3 mm thick, 20 mm
+# tall, 215 mm long rails protruding from the two ends).  The object frame is
+# the MESH frame: X is the long axis, Y is UP, Z is the depth.  The scene yaws
+# the body so X runs left-right and Y becomes world up.
+#     handle centres (object frame):  (+-0.2236, +0.0224, +0.0007)
+#     palm offset, hand coming down:  (      0,  +0.1200,       0)
+#     => wrist targets:               (+-0.2236, +0.1424, +0.0007)
+# Hands end up 0.447 m apart (natural stance separation is 0.429 m).
+#
+# Top handles, not side ones: an IK sweep over the arm joint limits showed
+# side handles need the wrists at y = +-0.29..0.33, which is at the edge of the
+# workspace (residual 0.017-0.056 m).  Reaching down onto top handles solves
+# with zero residual and the palm pointing straight down -- and it matches how
+# a person lifts a crate, and the +Z lift direction.
+#
+# Because the target includes the palm offset, "wrist within
+# task_align_enter_radius of its target" means "the hand is near the handle",
+# which is the trigger you want for ALIGN.
+left_grasp_position:   0.150 0.0200 0.0007
+right_grasp_position: -0.150 0.0200 0.0007
+
+# --- Optional explicit grasp orientation, OBJECT frame ---
+# Uncomment to override the box-face defaults.  Positions must be given as a
+# pair (both sides or neither).  Quaternions default to identity, meaning the
+# grasp frame is aligned with the object frame -- this revision does NOT plan a
+# palm-facing orientation, so set them yourself if the orientation error is to
+# mean anything physical.
+#
+# left_grasp_quaternion:  1.0  0.0  0.0  0.0
+# right_grasp_quaternion: 1.0  0.0  0.0  0.0
+#
+# NOTE: the assist corrects wrist POSITION only.  Wrist orientation is whatever
+# SONIC and the operator produce, so whether the fingers actually wrap the bar
+# still depends on the operator getting the wrist roll roughly right.
+
+# ============================================================================
+# Arm alignment assist (Step 5)
+# ============================================================================
+# SONIC does the whole approach on its own.  This only nudges the LAST few
+# centimetres, and only the arm joints (hardware 15-21 left, 22-28 right).
+# Legs, waist and torso are excluded structurally -- they never enter the
+# Jacobian, so no configuration can make the assist reach them.
+#
+# Runtime: press U at any time to toggle the assist off/on without stopping
+# the policy.  assist_enabled: false here keeps the observation/logging layer
+# running with no intervention at all.
+
+assist_enabled: true
+
+# Fixed blend weight.  No adaptation in this revision.  Hard-capped at 1.0.
+assist_alpha: 0.3
+
+# Gate on wrist-to-grasp-target distance:
+#   d >= engage_radius  -> alpha = 0      (SONIC alone)
+#   d <= full_radius    -> alpha = assist_alpha
+#   between             -> linear ramp
+assist_engage_radius: 0.10
+assist_full_radius: 0.02
+
+# Hard cap on the correction applied to any single joint in one control tick,
+# in radians.  The code clamps this to 0.15 rad regardless of what is written
+# here.  0.05 rad ~ 2.9 deg per tick at 50 Hz.
+assist_max_joint_correction: 0.05
+
+# Max change of alpha per control tick, so engaging or dropping out ramps
+# instead of stepping.  0.02 -> ~0.3 s to go from 0 to 0.3.
+assist_alpha_slew: 0.02
+
+# ============================================================================
+# Toy bimanual pick sequence (Step 6)
+# ============================================================================
+#   MANUAL -> ALIGN -> GRASP -> LIFT -> MANUAL
+#
+# MANUAL is pure SONIC. Every other state has a timeout back to MANUAL, and an
+# anomaly during LIFT latches ABORT, which switches the assist off until the
+# operator re-arms it (press U off, then on).
+#
+# Requires assist_enabled: true -- the sequence drives the arm assist.
+
+task_enabled: true
+
+# MANUAL -> ALIGN when BOTH wrists are inside this radius of their targets.
+task_align_enter_radius: 0.10
+# ALIGN -> MANUAL when EITHER wrist leaves this radius (hysteresis).
+task_align_exit_radius: 0.20
+# ALIGN -> GRASP when BOTH wrists are inside this radius.
+task_grasp_radius: 0.025
+
+task_align_timeout: 5.0
+
+# GRASP holds the close command this long before judging, then gives up at the
+# timeout. Grasp detection is joint feedback only: fingers that stall short of
+# the commanded closure are being blocked by something. There is no force or
+# tactile sensing here, so "grasp_success" means "an obstruction of roughly
+# object size", NOT a verified stable hold.
+task_grasp_settle: 0.6
+task_grasp_timeout: 2.0
+task_grasp_contact_margin: 0.15
+
+# LIFT ramps the grasp target up by this much along pelvis +Z (true vertical
+# only while the robot stands upright). Hard-capped at 0.15 m in code.
+task_lift_height: 0.05
+task_lift_duration: 2.0

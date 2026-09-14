@@ -38,7 +38,33 @@ class RobotFK
         ) const;
 
         int NumJoints() const { return node_children_.size(); }
-    
+
+        /**
+         * @brief Look up a body by its MJCF `name` attribute.
+         *
+         * The returned index addresses the `positions_world` / `rotations_world`
+         * arrays filled by DoFK(): index 0 is the root body (pelvis) and index
+         * `k >= 1` is the body actuated by MuJoCo/hardware joint `k - 1`.
+         *
+         * @return Body index, or -1 if no body carries that name.
+         */
+        int FindBodyIndex(const std::string &name) const;
+
+        /// MJCF name of body @p idx, or an empty string if out of range.
+        const std::string &BodyName(int idx) const;
+
+        /// Parent body index of @p idx; -1 for the root and for out-of-range input.
+        int Parent(int idx) const;
+
+        /**
+         * @brief Joint axis of body @p idx as declared in the MJCF, in the body's
+         *        own (post-rest-rotation) frame.
+         *
+         * The same axis in world coordinates is `quat_rotate(rotations_world[idx],
+         * JointAxis(idx))`, using the rotations DoFK() produced.
+         */
+        const std::array<double, 3> &JointAxis(int idx) const;
+
     private:
 
         void FKChildren(
@@ -54,5 +80,6 @@ class RobotFK
         std::vector< std::array<double, 3> > translations_;
         std::vector< std::array<double, 4> > rest_rotations_;
         std::vector< std::vector<int> > node_children_;
+        std::vector< int > node_parents_;
         std::vector< std::string > node_names_;
 };

@@ -66,7 +66,7 @@ IS_JETSON=false
 JETSON_MODEL=""
 DOCKERFILE="Dockerfile.ros2"  # Unified Dockerfile for all platforms
 IMAGE_NAME="g1-deploy-dev"
-CUDA_VERSION="12.4.1"  # Default for x86_64/ARM64
+CUDA_VERSION="12.9.1"  # Default for x86_64/ARM64
 
 # Enhanced Jetson detection
 if [[ "$(uname -m)" == "aarch64" ]]; then

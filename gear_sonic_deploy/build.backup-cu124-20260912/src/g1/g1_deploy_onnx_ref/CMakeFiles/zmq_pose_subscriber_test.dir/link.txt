@@ -1,0 +1,1 @@
+/usr/bin/c++  -O3 -ffast-math -O3 -DNDEBUG CMakeFiles/zmq_pose_subscriber_test.dir/tests/zmq_pose_subscriber_test.cpp.o -o ../../../../target/release/zmq_pose_subscriber_test  /usr/lib/x86_64-linux-gnu/libzmq.so 
