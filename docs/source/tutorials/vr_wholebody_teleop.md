@@ -76,6 +76,10 @@ If a firewall is enabled, allow TCP **5556** on the streamer host from the deplo
 
 ### Terminal 3 — PICO Teleop Streamer
 
+For physical Dex1-1 grippers, add `--hand-type dex1` to the deployment command.
+See [Dex1 grippers with SONIC](dex1.md) for the v1.1 command and simulation scope.
+The default hand backend remains Dex3.
+
 On the streamer host, from the **repo root**:
 
 ```bash

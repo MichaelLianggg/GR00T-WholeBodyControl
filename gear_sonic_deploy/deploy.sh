@@ -211,6 +211,7 @@ show_usage() {
     echo "  --input-type TYPE       Set the input type (default: zmq_manager)"
     echo "  --output-type TYPE      Set the output type (default: ros2)"
     echo "  --zmq-host HOST         Set the ZMQ host (default: localhost)"
+    echo "  --hand-type TYPE        End effector: dex3, dex1, or none (default: dex3)"
     echo "  --motor-kp-scale SPEC   Scale Kp for hardware motor indices/ranges"
     echo "  --motor-kd-scale SPEC   Scale Kd for hardware motor indices/ranges"
     echo ""
@@ -253,6 +254,7 @@ MOTION_DATA="$MOTION_DATA_DEFAULT"
 INPUT_TYPE="$INPUT_TYPE_DEFAULT"
 OUTPUT_TYPE="$OUTPUT_TYPE_DEFAULT"
 ZMQ_HOST="$ZMQ_HOST_DEFAULT"
+HAND_TYPE="dex3"
 MOTOR_KP_SCALES=()
 MOTOR_KD_SCALES=()
 
@@ -317,6 +319,16 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             ZMQ_HOST="$2"
+            shift 2
+            ;;
+        --hand-type)
+            case "${2:-}" in
+                dex1|dex3|none) HAND_TYPE="$2" ;;
+                *)
+                    echo -e "${RED}Error: --hand-type requires dex3, dex1, or none${NC}" >&2
+                    exit 1
+                    ;;
+            esac
             shift 2
             ;;
         --motor-kp-scale)
@@ -541,6 +553,7 @@ echo -e "  Planner:            ${GREEN}$PLANNER${NC}"
 echo -e "  Input Type:         ${GREEN}$INPUT_TYPE${NC}"
 echo -e "  Output Type:        ${GREEN}$OUTPUT_TYPE${NC}"
 echo -e "  ZMQ Host:           ${GREEN}$ZMQ_HOST${NC}"
+echo -e "  Hand Type:          ${GREEN}$HAND_TYPE${NC}"
 if (( ${#EXTRA_ARGS[@]} > 0 )); then
 printf -v EXTRA_ARGS_DISPLAY ' %q' "${EXTRA_ARGS[@]}"
 echo -e "  Extra Args:         ${GREEN}${EXTRA_ARGS_DISPLAY# }${NC}"
@@ -556,7 +569,8 @@ echo -e "${BLUE}    --encoder-file $CHECKPOINT_ENCODER \\${NC}"
 echo -e "${BLUE}    --planner-file $PLANNER \\${NC}"
 echo -e "${BLUE}    --input-type $INPUT_TYPE \\${NC}"
 echo -e "${BLUE}    --output-type $OUTPUT_TYPE \\${NC}"
-echo -e "${BLUE}    --zmq-host $ZMQ_HOST${NC}"
+echo -e "${BLUE}    --zmq-host $ZMQ_HOST \\${NC}"
+echo -e "${BLUE}    --hand-type $HAND_TYPE${NC}"
 if (( ${#EXTRA_ARGS[@]} > 0 )); then
 echo -e "${BLUE}    ${EXTRA_ARGS_DISPLAY# }${NC}"
 fi
@@ -585,6 +599,7 @@ if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
         --input-type "$INPUT_TYPE" \
         --output-type "$OUTPUT_TYPE" \
         --zmq-host "$ZMQ_HOST" \
+        --hand-type "$HAND_TYPE" \
         "${EXTRA_ARGS[@]}"
 else
     echo ""
