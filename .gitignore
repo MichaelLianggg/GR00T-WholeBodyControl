@@ -154,7 +154,7 @@ cython_debug/
 .vscode/
 
 # log
-outputs/
+#outputs/
 
 # Ruff stuff:
 .ruff_cache/
